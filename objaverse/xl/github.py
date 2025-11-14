@@ -9,7 +9,7 @@ import tarfile
 import tempfile
 from multiprocessing import Pool
 from typing import Callable, Dict, List, Literal, Optional
-
+from pathlib import Path
 import fsspec
 import pandas as pd
 import requests
@@ -32,6 +32,22 @@ FILE_EXTENSIONS = [
     ".ply",
     ".abc",
     ".blend",
+]
+
+EXTERNAL_FILES = [
+    ".mtl",
+    ".bin",
+    ".usdz",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tga",
+    ".tif",
+    ".tiff",
+    ".dds",
+    ".exr",
+    ".hdr",
+    ".webp",
 ]
 
 
@@ -207,7 +223,11 @@ class GitHubDownloader(ObjaverseSource):
         org, repo = repo_id.split("/")
 
         out = {}
-        with tempfile.TemporaryDirectory() as temp_dir:
+        dir_ = "/scratch/shared/beegfs/kaye/tmp"
+        os.path.exists(dir_) or os.makedirs(dir_, exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix="objaverse_gh_", dir=dir_)
+        # with tempfile.TemporaryDirectory() as temp_dir:
+        try:
             # clone the repo to a temp directory
             target_directory = os.path.join(temp_dir, repo)
             successful_clone = cls._git_shallow_clone(
@@ -321,6 +341,12 @@ class GitHubDownloader(ObjaverseSource):
             # remove the .git directory
             shutil.rmtree(os.path.join(target_directory, ".git"))
 
+            _valid_exts = FILE_EXTENSIONS + EXTERNAL_FILES
+            # remove files that are not in the valid extensions
+            for file in cls._list_files(target_directory):
+                if not any(file.lower().endswith(ext) for ext in _valid_exts):
+                    os.remove(file)
+
             if save_repo_format is None:
                 # remove the paths, since it's not downloaded
                 out = {}
@@ -368,6 +394,14 @@ class GitHubDownloader(ObjaverseSource):
                             dirname, repo, out[file_identifier]
                         )
 
+        # Ensure cleanup even if an exception is raised
+        finally:
+            if os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                    logger.debug(f"Deleted temp directory {temp_dir}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete temp dir {temp_dir}: {e}")
         # get each object that was missing from the expected objects
         if handle_missing_object is not None:
             obtained_urls = {x["fileIdentifier"] for x in file_hashes}
