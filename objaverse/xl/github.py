@@ -216,6 +216,7 @@ class GitHubDownloader(ObjaverseSource):
         handle_missing_object: Optional[Callable],
         handle_new_object: Optional[Callable],
         commit_hash: Optional[str],
+        on_finish: Optional[Callable] = None,
     ) -> Dict[str, str]:
         """Process a single repo.
 
@@ -292,6 +293,20 @@ class GitHubDownloader(ObjaverseSource):
             # pull the lfs files
             cls._pull_lfs_files(target_directory)
 
+            # NEW: Sanitize filenames before processing or archiving
+            cls._sanitize_filenames(target_directory)
+
+            # NEW: Clean up broken symbolic links before processing
+            # logger.debug(f"Scanning for and removing broken symlinks in {target_directory}")
+            all_paths = cls._list_files(target_directory)
+            for path in all_paths:
+                if os.path.islink(path) and not os.path.exists(path):
+                    logger.warning(f"Removing broken symbolic link: {path}")
+                    try:
+                        os.remove(path)
+                    except OSError as e:
+                        logger.error(f"Error removing broken link {path}: {e}")
+
             # get all the files in the repo
             files = cls._list_files(target_directory)
             files_with_3d_extension = [
@@ -303,7 +318,14 @@ class GitHubDownloader(ObjaverseSource):
             # get the sha256 for each file
             file_hashes = []
             for file in tqdm(files_with_3d_extension, desc="Handling 3D object files"):
-                file_hash = get_file_hash(file)
+                try:
+                    file_hash = get_file_hash(file)
+                except FileNotFoundError as e:
+                    logger.warning(
+                        f"Skipping broken symbolic link or missing file: {file}. Error: {e}"
+                    )
+                    continue
+
                 # remove the temp_dir from the file path
                 github_url = file.replace(
                     target_directory,
@@ -339,7 +361,7 @@ class GitHubDownloader(ObjaverseSource):
                     handle_new_object(
                         local_path=file,
                         file_identifier=github_url,
-                        sha256=file_hash,
+                        sha256=file_hash, 
                         metadata=dict(github_organization=org, github_repo=repo),
                     )
 
@@ -359,6 +381,7 @@ class GitHubDownloader(ObjaverseSource):
             for file in cls._list_files(target_directory):
                 if not any(file.lower().endswith(ext) for ext in _valid_exts):
                     os.remove(file)
+
 
             if save_repo_format is None:
                 # remove the paths, since it's not downloaded
@@ -426,7 +449,38 @@ class GitHubDownloader(ObjaverseSource):
                         metadata=dict(github_organization=org, github_repo=repo),
                     )
 
+        if on_finish is not None:
+            on_finish(repo_id=repo_id, local_path=target_directory, expected_objects=expected_objects)
+
         return out
+
+    @classmethod
+    def _sanitize_filenames(cls, root_dir: str) -> None:
+        """
+        Recursively rename files and directories with names that are not UTF-8 encodable.
+        Walks the tree from the bottom up to handle directories correctly.
+        """
+        for dirpath, dirnames, filenames in os.walk(root_dir, topdown=False):
+            for name in filenames + dirnames:
+                try:
+                    # Check if the name can be encoded to UTF-8
+                    name.encode("utf-8")
+                except UnicodeEncodeError:
+                    # If not, create a sanitized version
+                    sanitized_name = name.encode("utf-8", "surrogateescape").decode(
+                        "utf-8", "replace"
+                    )
+                    original_path = os.path.join(dirpath, name)
+                    sanitized_path = os.path.join(dirpath, sanitized_name)
+                    logger.warning(
+                        f"Renaming invalid filename: {original_path} -> {sanitized_path}"
+                    )
+                    try:
+                        os.rename(original_path, sanitized_path)
+                    except OSError as e:
+                        logger.error(
+                            f"Failed to rename {original_path} to {sanitized_path}: {e}"
+                        )
 
     @classmethod
     def _list_files(cls, root_dir: str) -> List[str]:
@@ -439,18 +493,36 @@ class GitHubDownloader(ObjaverseSource):
     @classmethod
     def _pull_lfs_files(cls, repo_dir: str) -> None:
         if cls._has_lfs_files(repo_dir):
-            subprocess.run(["git", "lfs", "pull"], cwd=repo_dir, check=True)
+            try:
+                subprocess.run(
+                    ["git", "lfs", "pull"],
+                    cwd=repo_dir,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+            except subprocess.CalledProcessError as e:
+                logger.warning(
+                    f"git lfs pull failed for {repo_dir} with exit code {e.returncode}."
+                )
+                if e.stderr:
+                    logger.warning(f"stderr: {e.stderr.decode('utf-8').strip()}")
 
     @classmethod
     def _has_lfs_files(cls, repo_dir: str) -> bool:
         gitattributes_path = os.path.join(repo_dir, ".gitattributes")
         if not os.path.exists(gitattributes_path):
             return False
-        with open(gitattributes_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if "filter=lfs" in line:
-                    return True
-        return False
+        try:
+            with open(gitattributes_path, "rb") as f:
+                # Read as bytes to avoid decoding errors.
+                # The string "filter=lfs" is pure ASCII, so its byte representation is safe.
+                return b"filter=lfs" in f.read()
+        except Exception as e:
+            logger.warning(
+                f"Could not read .gitattributes file at {gitattributes_path}: {e}"
+            )
+            return False
 
     @classmethod
     def _get_commit_hash_from_local_git_dir(cls, local_git_dir: str) -> str:
@@ -490,6 +562,7 @@ class GitHubDownloader(ObjaverseSource):
             handle_modified_object,
             handle_missing_object,
             handle_new_object,
+            on_finish,
         ) = args
         repo_id = "/".join(repo_id_hash.split("/")[:2])
         commit_hash = repo_id_hash.split("/")[2]
@@ -504,6 +577,7 @@ class GitHubDownloader(ObjaverseSource):
             handle_missing_object=handle_missing_object,
             handle_new_object=handle_new_object,
             commit_hash=commit_hash,
+            on_finish=on_finish,
         )
 
     @classmethod
@@ -600,6 +674,7 @@ class GitHubDownloader(ObjaverseSource):
         """
         save_repo_format = kwargs.get("save_repo_format", None)
         handle_new_object = kwargs.get("handle_new_object", None)
+        on_finish = kwargs.get("on_finish", None)
 
         if processes is None:
             processes = multiprocessing.cpu_count()
@@ -685,6 +760,7 @@ class GitHubDownloader(ObjaverseSource):
                 handle_modified_object,
                 handle_missing_object,
                 handle_new_object,
+                on_finish,
             )
             for repo_id_hash in repo_id_hashes_to_download
         ]
