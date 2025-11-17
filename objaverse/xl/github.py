@@ -8,8 +8,9 @@ import subprocess
 import tarfile
 import tempfile
 from multiprocessing import Pool
-from typing import Callable, Dict, List, Literal, Optional
 from pathlib import Path
+from typing import Callable, Dict, List, Literal, Optional
+
 import fsspec
 import pandas as pd
 import requests
@@ -72,20 +73,20 @@ class GitHubDownloader(ObjaverseSource):
             pd.DataFrame: The annotations, which includes the columns "thingId", "fileId",
                 "filename", and "license".
         """
-        filename = os.path.join(download_dir, "github", filename)
-        fs, path = fsspec.core.url_to_fs(filename)
-        fs.makedirs(os.path.dirname(path), exist_ok=True)
+        path = Path(download_dir).expanduser() / "github" / filename
+        fs, fs_path = fsspec.core.url_to_fs(str(path))
+        fs.makedirs(str(path.parent), exist_ok=True)
 
         # download the parquet file if it doesn't exist
-        if refresh or not fs.exists(path):
-            logger.info(f"Downloading {url} to {filename}")
+        if refresh or not fs.exists(fs_path):
+            logger.info(f"Downloading {url} to {path}")
             response = requests.get(url)
             response.raise_for_status()
-            with fs.open(path, "wb") as file:
+            with fs.open(fs_path, "wb") as file:
                 file.write(response.content)
 
         # load the parquet file with fsspec
-        with fs.open(path) as f:
+        with fs.open(fs_path) as f:
             df = pd.read_parquet(f)
 
         return df
@@ -217,6 +218,7 @@ class GitHubDownloader(ObjaverseSource):
         handle_new_object: Optional[Callable],
         commit_hash: Optional[str],
         on_finish: Optional[Callable] = None,
+        tmp_dir: Optional[Path] = None,
     ) -> Dict[str, str]:
         """Process a single repo.
 
@@ -237,15 +239,16 @@ class GitHubDownloader(ObjaverseSource):
         org, repo = repo_id.split("/")
 
         out = {}
-        dir_ = "/scratch/shared/beegfs/kaye/tmp"
-        os.path.exists(dir_) or os.makedirs(dir_, exist_ok=True)
-        temp_dir = tempfile.mkdtemp(prefix="objaverse_gh_", dir=dir_)
+        # dir_ = "/scratch/shared/beegfs/kaye/tmp"
+        tmp_path = Path(tmp_dir) if tmp_dir is not None else Path("/tmp")
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix="objaverse_gh_", dir=str(tmp_path))
         # with tempfile.TemporaryDirectory() as temp_dir:
         try:
             # clone the repo to a temp directory
-            target_directory = os.path.join(temp_dir, repo)
+            target_directory = Path(temp_dir) / repo
             successful_clone = cls._git_shallow_clone(
-                f"https://github.com/{org}/{repo}.git", target_directory
+                f"https://github.com/{org}/{repo}.git", str(target_directory)
             )
             if not successful_clone:
                 logger.error(f"Could not clone {repo_id}")
@@ -259,13 +262,15 @@ class GitHubDownloader(ObjaverseSource):
                 return {}
 
             # use the commit hash if specified
-            repo_commit_hash = cls._get_commit_hash_from_local_git_dir(target_directory)
+            repo_commit_hash = cls._get_commit_hash_from_local_git_dir(
+                str(target_directory)
+            )
             if commit_hash is not None:
                 keep_going = True
                 if repo_commit_hash != commit_hash:
                     # run git reset --hard && git checkout 37f4d8d287e201ce52c048bf74d46d6a09d26b2c
                     if not cls._run_command_with_check(
-                        ["git", "fetch", "origin", commit_hash], target_directory
+                        ["git", "fetch", "origin", commit_hash], str(target_directory)
                     ):
                         logger.error(
                             f"Error in git fetch! Sticking with {repo_commit_hash=} instead of {commit_hash=}"
@@ -273,7 +278,7 @@ class GitHubDownloader(ObjaverseSource):
                         keep_going = False
 
                     if keep_going and not cls._run_command_with_check(
-                        ["git", "reset", "--hard"], target_directory
+                        ["git", "reset", "--hard"], str(target_directory)
                     ):
                         logger.error(
                             f"Error in git reset! Sticking with {repo_commit_hash=} instead of {commit_hash=}"
@@ -282,7 +287,7 @@ class GitHubDownloader(ObjaverseSource):
 
                     if keep_going:
                         if cls._run_command_with_check(
-                            ["git", "checkout", commit_hash], target_directory
+                            ["git", "checkout", commit_hash], str(target_directory)
                         ):
                             repo_commit_hash = commit_hash
                         else:
@@ -291,28 +296,27 @@ class GitHubDownloader(ObjaverseSource):
                             )
 
             # pull the lfs files
-            cls._pull_lfs_files(target_directory)
+            cls._pull_lfs_files(str(target_directory))
 
             # NEW: Sanitize filenames before processing or archiving
-            cls._sanitize_filenames(target_directory)
+            cls._sanitize_filenames(str(target_directory))
 
             # NEW: Clean up broken symbolic links before processing
             # logger.debug(f"Scanning for and removing broken symlinks in {target_directory}")
-            all_paths = cls._list_files(target_directory)
+            all_paths = cls._list_files(str(target_directory))
             for path in all_paths:
-                if os.path.islink(path) and not os.path.exists(path):
+                path_obj = Path(path)
+                if path_obj.is_symlink() and not path_obj.exists():
                     logger.warning(f"Removing broken symbolic link: {path}")
                     try:
-                        os.remove(path)
+                        path_obj.unlink()
                     except OSError as e:
                         logger.error(f"Error removing broken link {path}: {e}")
 
             # get all the files in the repo
-            files = cls._list_files(target_directory)
+            files = cls._list_files(str(target_directory))
             files_with_3d_extension = [
-                file
-                for file in files
-                if any(file.lower().endswith(ext) for ext in FILE_EXTENSIONS)
+                file for file in files if Path(file).suffix.lower() in FILE_EXTENSIONS
             ]
 
             # get the sha256 for each file
@@ -328,14 +332,14 @@ class GitHubDownloader(ObjaverseSource):
 
                 # remove the temp_dir from the file path
                 github_url = file.replace(
-                    target_directory,
+                    str(target_directory),
                     f"https://github.com/{org}/{repo}/blob/{repo_commit_hash}",
                 )
                 file_hashes.append(dict(sha256=file_hash, fileIdentifier=github_url))
 
                 # handle the object under different conditions
                 if github_url in expected_objects:
-                    out[github_url] = file[len(target_directory) + 1 :]
+                    out[github_url] = str(Path(file).relative_to(target_directory))
                     if expected_objects[github_url] == file_hash:
                         if handle_found_object is not None:
                             handle_found_object(
@@ -361,27 +365,24 @@ class GitHubDownloader(ObjaverseSource):
                     handle_new_object(
                         local_path=file,
                         file_identifier=github_url,
-                        sha256=file_hash, 
+                        sha256=file_hash,
                         metadata=dict(github_organization=org, github_repo=repo),
                     )
 
             # save the file hashes to a json file
-            with open(
-                os.path.join(target_directory, ".objaverse-file-hashes.json"),
-                "w",
-                encoding="utf-8",
+            with (target_directory / ".objaverse-file-hashes.json").open(
+                "w", encoding="utf-8"
             ) as f:
                 json.dump(file_hashes, f, indent=2)
 
             # remove the .git directory
-            shutil.rmtree(os.path.join(target_directory, ".git"))
+            shutil.rmtree(target_directory / ".git")
 
             _valid_exts = FILE_EXTENSIONS + EXTERNAL_FILES
             # remove files that are not in the valid extensions
-            for file in cls._list_files(target_directory):
-                if not any(file.lower().endswith(ext) for ext in _valid_exts):
-                    os.remove(file)
-
+            for file in cls._list_files(str(target_directory)):
+                if Path(file).suffix.lower() not in _valid_exts:
+                    Path(file).unlink()
 
             if save_repo_format is None:
                 # remove the paths, since it's not downloaded
@@ -390,17 +391,15 @@ class GitHubDownloader(ObjaverseSource):
                 logger.debug(f"Saving {org}/{repo} as {save_repo_format}")
                 # save the repo to a zip file
                 if save_repo_format == "zip":
-                    shutil.make_archive(target_directory, "zip", target_directory)
+                    shutil.make_archive(
+                        str(target_directory), "zip", str(target_directory)
+                    )
                 elif save_repo_format == "tar":
-                    with tarfile.open(
-                        os.path.join(temp_dir, f"{repo}.tar"), "w"
-                    ) as tar:
-                        tar.add(target_directory, arcname=repo)
+                    with tarfile.open(Path(temp_dir) / f"{repo}.tar", "w") as tar:
+                        tar.add(str(target_directory), arcname=repo)
                 elif save_repo_format == "tar.gz":
-                    with tarfile.open(
-                        os.path.join(temp_dir, f"{repo}.tar.gz"), "w:gz"
-                    ) as tar:
-                        tar.add(target_directory, arcname=repo)
+                    with tarfile.open(Path(temp_dir) / f"{repo}.tar.gz", "w:gz") as tar:
+                        tar.add(str(target_directory), arcname=repo)
                 elif save_repo_format == "files":
                     pass
                 else:
@@ -408,31 +407,33 @@ class GitHubDownloader(ObjaverseSource):
                         f"save_repo_format must be one of zip, tar, tar.gz, files. Got {save_repo_format}"
                     )
 
-                dirname = os.path.join(base_dir, "repos", org)
-                fs.makedirs(dirname, exist_ok=True)
+                dirname = Path(base_dir) / "repos" / org
+                fs.makedirs(str(dirname), exist_ok=True)
                 if save_repo_format != "files":
                     # move the repo to the correct location (with put)
                     fs.put(
-                        os.path.join(temp_dir, f"{repo}.{save_repo_format}"),
-                        os.path.join(dirname, f"{repo}.{save_repo_format}"),
+                        str(Path(temp_dir) / f"{repo}.{save_repo_format}"),
+                        str(dirname / f"{repo}.{save_repo_format}"),
                     )
 
                     for file_identifier in out.copy():
-                        out[file_identifier] = os.path.join(
-                            dirname, f"{repo}.{save_repo_format}", out[file_identifier]
+                        out[file_identifier] = str(
+                            dirname
+                            / f"{repo}.{save_repo_format}"
+                            / out[file_identifier]
                         )
                 else:
                     # move the repo to the correct location (with put)
-                    fs.put(target_directory, dirname, recursive=True)
+                    fs.put(str(target_directory), str(dirname), recursive=True)
 
                     for file_identifier in out.copy():
-                        out[file_identifier] = os.path.join(
-                            dirname, repo, out[file_identifier]
+                        out[file_identifier] = str(
+                            dirname / repo / out[file_identifier]
                         )
 
         # Ensure cleanup even if an exception is raised
         finally:
-            if os.path.exists(temp_dir):
+            if Path(temp_dir).exists():
                 try:
                     shutil.rmtree(temp_dir)
                     logger.debug(f"Deleted temp directory {temp_dir}")
@@ -450,7 +451,11 @@ class GitHubDownloader(ObjaverseSource):
                     )
 
         if on_finish is not None:
-            on_finish(repo_id=repo_id, local_path=target_directory, expected_objects=expected_objects)
+            on_finish(
+                repo_id=repo_id,
+                local_path=str(target_directory),
+                expected_objects=expected_objects,
+            )
 
         return out
 
@@ -470,13 +475,13 @@ class GitHubDownloader(ObjaverseSource):
                     sanitized_name = name.encode("utf-8", "surrogateescape").decode(
                         "utf-8", "replace"
                     )
-                    original_path = os.path.join(dirpath, name)
-                    sanitized_path = os.path.join(dirpath, sanitized_name)
+                    original_path = Path(dirpath) / name
+                    sanitized_path = Path(dirpath) / sanitized_name
                     logger.warning(
                         f"Renaming invalid filename: {original_path} -> {sanitized_path}"
                     )
                     try:
-                        os.rename(original_path, sanitized_path)
+                        original_path.rename(sanitized_path)
                     except OSError as e:
                         logger.error(
                             f"Failed to rename {original_path} to {sanitized_path}: {e}"
@@ -510,8 +515,8 @@ class GitHubDownloader(ObjaverseSource):
 
     @classmethod
     def _has_lfs_files(cls, repo_dir: str) -> bool:
-        gitattributes_path = os.path.join(repo_dir, ".gitattributes")
-        if not os.path.exists(gitattributes_path):
+        gitattributes_path = Path(repo_dir) / ".gitattributes"
+        if not gitattributes_path.exists():
             return False
         try:
             with open(gitattributes_path, "rb") as f:
@@ -563,6 +568,7 @@ class GitHubDownloader(ObjaverseSource):
             handle_missing_object,
             handle_new_object,
             on_finish,
+            tmp_dir,
         ) = args
         repo_id = "/".join(repo_id_hash.split("/")[:2])
         commit_hash = repo_id_hash.split("/")[2]
@@ -578,6 +584,7 @@ class GitHubDownloader(ObjaverseSource):
             handle_new_object=handle_new_object,
             commit_hash=commit_hash,
             on_finish=on_finish,
+            tmp_dir=tmp_dir,
         )
 
     @classmethod
@@ -663,6 +670,18 @@ class GitHubDownloader(ObjaverseSource):
                 - metadata (Dict[str, Any]): Metadata about the 3D object, including the
                     GitHub organization and repo names.
                 Return is not used. Defaults to None.
+            on_finish (Optional[Callable], optional): Called when a repository has
+                finished downloading and processing. Args for the function include:
+                - repo_id (str): GitHub repo ID in the format of organization/repo.
+                - local_path (str): Local path to the downloaded repository.
+                - expected_objects (Dict[str, str]): Dictionary of objects that one
+                    expects to find in the repo. Keys are the "fileIdentifier" (i.e.,
+                    the GitHub URL in this case) and values are the "sha256" of the
+                    objects.
+                Return is not used. Defaults to None.
+            tmp_dir (Optional[Path], optional): Temporary directory to use for
+                downloading and processing repositories. If None, the system default
+                temporary directory will be used. Defaults to None.
 
         Raises:
             ValueError: If download_dir is None and save_repo_format is not None.
@@ -675,6 +694,7 @@ class GitHubDownloader(ObjaverseSource):
         save_repo_format = kwargs.get("save_repo_format", None)
         handle_new_object = kwargs.get("handle_new_object", None)
         on_finish = kwargs.get("on_finish", None)
+        tmp_dir = kwargs.get("tmp_dir", None)
 
         if processes is None:
             processes = multiprocessing.cpu_count()
@@ -686,24 +706,26 @@ class GitHubDownloader(ObjaverseSource):
             # path doesn't matter if we're not saving the repo
             download_dir = "~/.objaverse"
 
-        base_download_dir = os.path.join(download_dir, "github")
-        fs, path = fsspec.core.url_to_fs(base_download_dir)
+        base_download_dir = Path(download_dir).expanduser() / "github"
+        fs, path = fsspec.core.url_to_fs(str(base_download_dir))
         fs.makedirs(path, exist_ok=True)
 
         # Getting immediate subdirectories of root_path
         if save_repo_format == "files":
-            downloaded_repo_dirs = fs.glob(base_download_dir + "/repos/*/*/")
+            downloaded_repo_dirs = fs.glob(
+                str(base_download_dir / "repos" / "*" / "*") + "/"
+            )
             downloaded_repo_ids = {
                 "/".join(x.split("/")[-2:]) for x in downloaded_repo_dirs
             }
         else:
             downloaded_repo_dirs = fs.glob(
-                base_download_dir + f"/repos/*/*.{save_repo_format}"
+                str(base_download_dir / "repos" / "*" / f"*.{save_repo_format}")
             )
             downloaded_repo_ids = set()
             for x in downloaded_repo_dirs:
-                org, repo = x.split("/")[-2:]
-                repo = repo[: -len(f".{save_repo_format}")]
+                org, repo_filename = x.split("/")[-2:]
+                repo = repo_filename[: -len(f".{save_repo_format}")]
                 repo_id = f"{org}/{repo}"
                 downloaded_repo_ids.add(repo_id)
 
@@ -761,6 +783,7 @@ class GitHubDownloader(ObjaverseSource):
                 handle_missing_object,
                 handle_new_object,
                 on_finish,
+                tmp_dir,
             )
             for repo_id_hash in repo_id_hashes_to_download
         ]
